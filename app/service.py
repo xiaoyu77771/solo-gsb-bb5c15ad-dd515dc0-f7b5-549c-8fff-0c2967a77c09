@@ -104,6 +104,23 @@
    reservation < released，预占与冷却附 expires_at；边端点小者为
    source 并附 reasons；簇按最小节点键排序、cluster_id 从 1 编号，
    簇内节点与边均确定性排序
+
+快照 Merkle 包含证明（build_snapshot_proof，
+POST /namespaces/{namespace}/snapshot-proof）：
+1. 接收 1–20 个由 kind/id 表示的节点与 max_nodes（1–500），在单个只读
+   事务（BEGIN 读事务）中固定命名空间的生效脚本策略、已注册名称、未过期
+   未消费预占与未过期冷却；四类数据共享同一数据库快照，只读路径不做惰性
+   清理，过期 / 已消费记录在 Python 侧过滤
+2. 业务快照节点总量（不含策略叶）超过 max_nodes 即抛
+   SnapshotTooLargeError（-> 413），不截断、不建树；随后校验请求节点全部
+   存在于快照，任一缺失抛 SnapshotNodesNotFoundError（-> 404，附全部
+   缺失项）
+3. 叶集合为 1 个恒存在的 script_policy 叶（未配置时固定内建默认策略，
+   revision=0；下标恒为 0）加全部业务叶，按 (类型序, id) 排序后把业务
+   字段编码为规范 JSON（键排序、紧凑分隔、UTF-8 原样非 ASCII），以
+   SHA-256 构建 Merkle 树：叶 H(0x00||json)，父 H(0x01||left||right)，
+   奇数层复制末节点。证明为自叶向上的兄弟哈希 + left/right 方向，只由
+   排序后下标决定——相同快照下请求节点顺序变化不改变根与各自证明
 """
 from __future__ import annotations
 
@@ -119,6 +136,7 @@ from .analysis import (
     analyze_scripts,
     normalize_name,
 )
+from .merkle import inclusion_proof, leaf_hash, merkle_root
 
 REASON_NORMALIZED_MATCH = "normalized_match"
 REASON_CONFUSABLE = "confusable"
@@ -284,6 +302,31 @@ class RiskSnapshotTooLargeError(Exception):
         super().__init__("risk_snapshot_too_large")
         self.snapshot_count = snapshot_count
         self.limit = limit
+
+
+class SnapshotTooLargeError(Exception):
+    """命名空间快照业务节点总量超过请求方给定的 max_nodes（HTTP 413）。
+
+    snapshot_count 为同一读事务快照内的实际业务节点总数（已注册名称 +
+    有效预占 + 未过期冷却，不含脚本策略叶），limit 为请求方给定的上限；
+    超限后不构建树、不生成任何证明，绝不为了凑上限而截断快照。
+    """
+
+    def __init__(self, snapshot_count: int, limit: int):
+        super().__init__("snapshot_too_large")
+        self.snapshot_count = snapshot_count
+        self.limit = limit
+
+
+class SnapshotNodesNotFoundError(Exception):
+    """请求包含证明的节点不存在于快照中（不存在 / 已过期 / 已消费，HTTP 404）。
+
+    missing 为缺失节点引用列表，每项 {"kind": ..., "id": ...}，按请求顺序给出。
+    """
+
+    def __init__(self, missing: list[dict]):
+        super().__init__("snapshot_nodes_not_found")
+        self.missing = missing
 
 
 def utc_now() -> datetime:
@@ -1841,3 +1884,214 @@ def _edge_sort_key(edge: dict) -> tuple:
         (target["namespace"], RISK_KIND_ORDER[target["kind"]], target["id"]),
         tuple(edge["reasons"]),
     )
+
+
+# ---------- 快照 Merkle 包含证明（POST .../snapshot-proof） ----------
+
+
+# 快照叶的类型序：脚本策略叶恒在最前，随后与风险簇一致
+# registered < reservation < released；排序先按该序值再按 id
+SNAPSHOT_KIND_ORDER = {
+    "script_policy": 0,
+    SOURCE_REGISTERED: 1,
+    SOURCE_RESERVATION: 2,
+    SOURCE_RELEASED: 3,
+}
+
+# 脚本策略叶的固定 id（策略不是业务记录，没有自增 id）
+SCRIPT_POLICY_LEAF_ID = 0
+
+
+def _proof_registered_rows(
+    conn: sqlite3.Connection, namespace: str
+) -> list[dict]:
+    """读取命名空间全部已注册名称（单独函数，便于并发测试注入）。"""
+    rows = conn.execute(
+        """
+        SELECT id, namespace, original_name, normalized_name, revision, created_at
+        FROM display_names
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _proof_reservation_rows(
+    conn: sqlite3.Connection, namespace: str, now: datetime
+) -> list[dict]:
+    """读取命名空间未消费、未过期预占（单独函数，便于并发测试注入）。"""
+    rows = conn.execute(
+        """
+        SELECT id, namespace, original_name, normalized_name, expires_at, created_at
+        FROM name_reservations
+        WHERE namespace = ? AND consumed_at IS NULL
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def _proof_cooldown_rows(
+    conn: sqlite3.Connection, namespace: str, now: datetime
+) -> list[dict]:
+    """读取命名空间未过期释放冷却记录（单独函数，便于并发测试注入）。"""
+    rows = conn.execute(
+        """
+        SELECT id, namespace, original_name, normalized_name,
+               cooldown_seconds, expires_at, created_at
+        FROM name_cooldowns
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def _effective_policy_leaf(conn: sqlite3.Connection, namespace: str) -> dict:
+    """组装生效脚本策略叶载荷：已配置用库中策略；未配置用内建默认策略。
+
+    未配置时 configured=False、revision=0、blocked_script_pairs 为内建默认
+    三对——与各写入 / check 接口实际生效的判定一致，使默认策略也被快照固定。
+    """
+    policy = get_script_policy(conn, namespace)
+    if policy is None:
+        return {
+            "kind": "script_policy",
+            "id": SCRIPT_POLICY_LEAF_ID,
+            "namespace": namespace,
+            "configured": False,
+            "revision": 0,
+            "blocked_script_pairs": [list(pair) for pair in DEFAULT_BLOCKED_PAIRS],
+        }
+    return {
+        "kind": "script_policy",
+        "id": SCRIPT_POLICY_LEAF_ID,
+        "namespace": namespace,
+        "configured": True,
+        "revision": policy["revision"],
+        "blocked_script_pairs": [list(pair) for pair in policy["blocked_script_pairs"]],
+    }
+
+
+def _business_leaf_payload(row: dict, kind: str) -> dict:
+    """把业务行组装为叶载荷（规范 JSON 的内容视图）。
+
+    字段集合跨类型固定（不适用的字段显式为 None），与响应中回显的叶视图
+    逐键一致，使验证方可以直接把响应 JSON 规范编码后重算叶哈希；规范编码
+    时键按字典序排列，故此处字段书写顺序无关哈希。
+    """
+    return {
+        "kind": kind,
+        "id": row["id"],
+        "namespace": row["namespace"],
+        "original_name": row["original_name"],
+        "normalized_name": row["normalized_name"],
+        "revision": row["revision"] if kind == SOURCE_REGISTERED else None,
+        "cooldown_seconds": (
+            row["cooldown_seconds"] if kind == SOURCE_RELEASED else None
+        ),
+        "expires_at": (
+            row["expires_at"] if kind in (SOURCE_RESERVATION, SOURCE_RELEASED) else None
+        ),
+        "created_at": row["created_at"],
+    }
+
+
+def build_snapshot_proof(
+    conn: sqlite3.Connection,
+    namespace: str,
+    nodes: list[dict],
+    max_nodes: int,
+    now: datetime | None = None,
+) -> dict:
+    """单个只读事务内固定快照，构建 SHA-256 Merkle 树并返回包含证明。
+
+    在**同一个只读事务（BEGIN）**中依次读取命名空间的生效脚本策略、已注册
+    名称、未消费未过期预占与未过期释放冷却，使四类数据来自同一份数据库
+    快照（事务期间其他连接的提交对本连接不可见）；只读路径不做惰性清理，
+    过期 / 已消费记录在 Python 侧过滤，与风险簇 / check 只读路径一致。
+
+    业务节点总量（已注册 + 预占 + 冷却，不含策略叶）超过 max_nodes 时立即
+    抛 SnapshotTooLargeError（-> 413），**不截断、不构建树**。随后校验请求
+    的全部 (kind, id) 都存在于快照，任一缺失抛 SnapshotNodesNotFoundError
+    （-> 404，按请求顺序附全部缺失引用）。
+
+    叶集合 = 1 个恒存在的 script_policy 叶（排序后下标 0）+ 全部业务叶，
+    按 (类型序, id) 排序后以规范 JSON 叶哈希构建 Merkle 树（叶 0x00、父
+    0x01、奇数层复制末节点）。请求节点的证明只由其排序后位置决定，故相同
+    快照下请求顺序变化不改变根，也不改变各节点自身的证明步骤。
+    """
+    moment = now or utc_now()
+
+    # 单一读事务固定全部快照：事务期间其他连接的提交对本连接不可见
+    conn.execute("BEGIN")
+    try:
+        registered = _proof_registered_rows(conn, namespace)
+        reservations = _proof_reservation_rows(conn, namespace, moment)
+        cooldowns = _proof_cooldown_rows(conn, namespace, moment)
+        policy_leaf = _effective_policy_leaf(conn, namespace)
+    finally:
+        conn.rollback()
+
+    snapshot_count = len(registered) + len(reservations) + len(cooldowns)
+    if snapshot_count > max_nodes:
+        raise SnapshotTooLargeError(snapshot_count, max_nodes)
+
+    # 业务叶按 (类型序, id) 排序：SQL 已按 id 升序，按类型顺序拼接即可
+    leaves: list[dict] = [policy_leaf]
+    for row in registered:
+        leaves.append(_business_leaf_payload(row, SOURCE_REGISTERED))
+    for row in reservations:
+        leaves.append(_business_leaf_payload(row, SOURCE_RESERVATION))
+    for row in cooldowns:
+        leaves.append(_business_leaf_payload(row, SOURCE_RELEASED))
+
+    leaf_key = {(leaf["kind"], leaf["id"]): index for index, leaf in enumerate(leaves)}
+
+    # 全部请求节点都必须存在于快照（按请求顺序收集缺失项）
+    missing = [
+        {"kind": node["kind"], "id": node["id"]}
+        for node in nodes
+        if (node["kind"], node["id"]) not in leaf_key
+    ]
+    if missing:
+        raise SnapshotNodesNotFoundError(missing)
+
+    hashes = [leaf_hash(leaf) for leaf in leaves]
+    root = merkle_root(hashes)
+
+    # items 按请求顺序回显；证明只由排序后下标决定，与请求顺序无关
+    items: list[dict] = []
+    for node in nodes:
+        index = leaf_key[(node["kind"], node["id"])]
+        items.append(
+            {
+                "kind": node["kind"],
+                "id": node["id"],
+                "leaf": {**leaves[index], "leaf_hash": hashes[index].hex()},
+                "leaf_index": index,
+                "proof": inclusion_proof(hashes, index),
+            }
+        )
+
+    return {
+        "namespace": namespace,
+        "root": root.hex(),
+        "leaf_count": len(leaves),
+        "snapshot_count": snapshot_count,
+        "max_nodes": max_nodes,
+        "policy": {key: value for key, value in policy_leaf.items() if key != "id"},
+        "items": items,
+    }

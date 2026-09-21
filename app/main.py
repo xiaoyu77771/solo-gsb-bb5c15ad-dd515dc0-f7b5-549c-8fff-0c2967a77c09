@@ -15,6 +15,7 @@
 - POST   /namespaces/{namespace}/check                              只分析不落库（200）
 - GET    /namespaces/{namespace}/names                              列出命名空间内已注册名称
 - POST   /name-risk-clusters                                        跨空间同形风险簇（200 / 413 / 422，单一读事务快照）
+- POST   /namespaces/{namespace}/snapshot-proof                     快照 Merkle 包含证明（200 / 404 / 413 / 422，单一读事务快照）
 - GET    /health                                                    健康检查
 """
 from __future__ import annotations
@@ -45,6 +46,8 @@ from .schemas import (
     ReservationRequest,
     ScriptPolicy,
     ScriptPolicyRequest,
+    SnapshotProofRequest,
+    SnapshotProofResponse,
     SwapNamesRequest,
     SwapNamesResponse,
 )
@@ -59,7 +62,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
@@ -78,7 +81,11 @@ app = FastAPI(
         "SQLite 读事务快照上固定 2–20 个命名空间的已注册名称、有效预占与"
         "未过期冷却，只对不同空间的名称按规范名相同或同形建边，按连通分量"
         "返回至少含 2 个节点的风险簇（快照总量超过 max_names 时返回 413，"
-        "不截断计算）。"
+        "不截断计算）；支持对单个命名空间生成快照 Merkle 包含证明"
+        "（POST /namespaces/{namespace}/snapshot-proof）：在单个 SQLite 读事务"
+        "快照上固定生效脚本策略、已注册名称、有效预占与未过期冷却，按类型与 id "
+        "排序后以规范 JSON + SHA-256 构建 Merkle 树（叶 0x00、父 0x01、奇数层"
+        "复制末节点），为 1–20 个请求节点返回带左右方向的包含证明。"
     ),
     lifespan=lifespan,
 )
@@ -174,6 +181,76 @@ def name_risk_clusters(
                 ),
                 "snapshot_count": exc.snapshot_count,
                 "max_names": exc.limit,
+            },
+        )
+
+
+@app.post(
+    "/namespaces/{namespace}/snapshot-proof",
+    response_model=SnapshotProofResponse,
+    responses={
+        404: {"description": "请求的节点在当前快照中不存在（不存在 / 已过期 / 已消费），附全部缺失引用"},
+        413: {"description": "命名空间业务快照节点总量超过 max_nodes，未截断快照、未构建树"},
+        422: {"description": "nodes 数量不在 1–20 个范围、含重复 (kind, id)，或 max_nodes 超出 1–500"},
+    },
+)
+def snapshot_proof(
+    namespace: str, payload: SnapshotProofRequest, conn=Depends(get_db)
+) -> dict:
+    """快照 Merkle 包含证明：在同一个 SQLite 读事务快照上固定并承诺数据。
+
+    接收 1–20 个由 `kind`（registered/reservation/released）与 `id` 表示的
+    节点及 `max_nodes`（1–500）。在**单个只读事务**中固定该命名空间的
+    **生效脚本策略、已注册名称、未过期未消费预占与未过期释放冷却**（只读、
+    不清理过期记录）；业务快照节点总量超过 `max_nodes` 时直接返回
+    `413 snapshot_too_large`（附 snapshot_count 与 max_nodes），**不截断
+    快照、不构建树**。随后校验请求节点全部存在于快照，任一缺失返回
+    `404 snapshot_nodes_not_found`（按请求顺序附全部缺失的 kind/id）。
+
+    Merkle 叶集合为 1 个恒存在的 `script_policy` 叶（排序后下标恒为 0；
+    命名空间未配置策略时固定内建默认策略，revision=0）加全部业务叶，按
+    **（类型序, id）**排序（script_policy < registered < reservation <
+    released）。每个叶把业务字段编码为**规范 JSON**（键按字典序、紧凑分隔、
+    UTF-8 原样保留非 ASCII），叶哈希 `SHA-256(0x00 || json)`，父哈希
+    `SHA-256(0x01 || left || right)`，每层奇数个节点时复制末节点与自身配对。
+
+    响应给出 `root`、`leaf_count`（业务节点数 + 1 个策略叶）以及每个请求
+    节点的叶载荷、叶下标与包含证明：证明步骤自叶向上，`direction` 为兄弟
+    节点方向（left 时 `parent=H(0x01||sibling||current)`，right 时反之），
+    `hash` 为兄弟哈希的十六进制。证明只由节点排序后的位置决定，故**相同
+    快照下请求节点顺序变化不改变根，也不改变各节点自身的证明**；`items`
+    仅按请求顺序回显以便客户端对齐。
+    """
+    nodes = [{"kind": item.kind, "id": item.id} for item in payload.nodes]
+    try:
+        return service.build_snapshot_proof(
+            conn, namespace, nodes, payload.max_nodes
+        )
+    except service.SnapshotTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,  # 413 Payload Too Large（新旧 starlette 常量名不同，直接用字面值）
+            detail={
+                "error": "snapshot_too_large",
+                "message": (
+                    "该命名空间的已注册名称、有效预占与未过期冷却快照总量"
+                    f"为 {exc.snapshot_count}，超过请求给定的 max_nodes="
+                    f"{exc.limit}；未截断快照，也未构建 Merkle 树，请收窄"
+                    "命名空间数据范围或提高 max_nodes 后重试"
+                ),
+                "snapshot_count": exc.snapshot_count,
+                "max_nodes": exc.limit,
+            },
+        )
+    except service.SnapshotNodesNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "snapshot_nodes_not_found",
+                "message": (
+                    "请求的部分节点在当前快照中不存在（记录不存在，"
+                    "或预占 / 冷却已过期、预占已被消费）"
+                ),
+                "missing": exc.missing,
             },
         )
 

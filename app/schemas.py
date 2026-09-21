@@ -421,6 +421,141 @@ class NameRiskClustersResponse(BaseModel):
     )
 
 
+# ---------- 快照 Merkle 包含证明 ----------
+
+# 一次快照证明请求的节点数上限
+MIN_SNAPSHOT_PROOF_NODES = 1
+MAX_SNAPSHOT_PROOF_NODES = 20
+# 单命名空间业务快照节点（已注册名称 + 有效预占 + 未过期冷却）上限
+MAX_SNAPSHOT_NODES = 500
+
+# 三类业务节点；script_policy 为快照中恒存在的特殊叶
+SnapshotProofNodeKind = Literal["registered", "reservation", "released"]
+
+
+class SnapshotProofNodeRef(BaseModel):
+    """请求包含证明的节点引用：kind + id（同一命名空间内定位一个快照节点）。"""
+
+    kind: SnapshotProofNodeKind
+    id: int = Field(ge=1)
+
+
+class SnapshotProofRequest(BaseModel):
+    """快照包含证明请求体：1–20 个互不相同的 kind/id 节点 + 业务快照上限。"""
+
+    nodes: list[SnapshotProofNodeRef] = Field(
+        min_length=MIN_SNAPSHOT_PROOF_NODES,
+        max_length=MAX_SNAPSHOT_PROOF_NODES,
+        examples=[[{"kind": "registered", "id": 1}]],
+        description=(
+            "待取得包含证明的节点引用，1–20 个且 (kind, id) 互不相同；"
+            "请求顺序不影响根与各节点证明（证明只由按类型、id 排序后的位置决定）"
+        ),
+    )
+    max_nodes: int = Field(
+        ge=1,
+        le=MAX_SNAPSHOT_NODES,
+        examples=[500],
+        description=(
+            "该命名空间已注册名称、有效预占与未过期冷却快照节点的总量上限；"
+            "实际业务快照总量超过该值时返回 413 且不截断、不构建树"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_nodes(self) -> "SnapshotProofRequest":
+        keys = [(node.kind, node.id) for node in self.nodes]
+        if len(set(keys)) != len(keys):
+            raise ValueError("nodes 中的 (kind, id) 必须互不相同")
+        return self
+
+
+class SnapshotEffectivePolicy(BaseModel):
+    """快照固定的生效脚本策略（未配置时回显内建默认策略，revision=0）。"""
+
+    kind: Literal["script_policy"] = "script_policy"
+    revision: int = Field(
+        description="策略版本：已配置为库中 revision；未配置时为 0（内建默认策略）"
+    )
+    blocked_script_pairs: list[list[str]] = Field(
+        description="快照时点生效的阻断脚本对（按字典序排列）"
+    )
+    configured: bool = Field(
+        description="命名空间是否显式配置过策略；false 时 blocked_script_pairs 为内建默认策略"
+    )
+
+
+class SnapshotProofLeaf(BaseModel):
+    """证明项回显：节点稳定标识 + 叶业务字段 + 叶哈希（0x00 前缀）。"""
+
+    kind: SnapshotProofNodeKind
+    id: int
+    namespace: str
+    original_name: str
+    normalized_name: str
+    revision: int | None = Field(
+        default=None,
+        description="仅 registered 节点出现：乐观锁版本",
+    )
+    expires_at: str | None = Field(
+        default=None,
+        description="仅 reservation / released 节点出现：预占有效期 / 冷却到期时刻",
+    )
+    cooldown_seconds: int | None = Field(
+        default=None,
+        description="仅 released 节点出现：本次释放设置的冷却时长（秒）",
+    )
+    created_at: str
+    leaf_hash: str = Field(description="该叶的 SHA-256 哈希（十六进制）：SHA-256(0x00 || 规范 JSON)")
+
+
+class SnapshotProofStep(BaseModel):
+    """包含证明的一层：兄弟节点哈希与它相对当前节点的方向。"""
+
+    direction: Literal["left", "right"] = Field(
+        description=(
+            "兄弟节点的方向：left 表示 parent=H(0x01||sibling||current)；"
+            "right 表示 parent=H(0x01||current||sibling)"
+        )
+    )
+    hash: str = Field(description="兄弟节点哈希（十六进制）")
+
+
+class SnapshotProofItem(BaseModel):
+    """单个请求节点的包含证明：按请求顺序回显，内容与请求顺序无关。"""
+
+    kind: SnapshotProofNodeKind
+    id: int
+    leaf: SnapshotProofLeaf = Field(description="该节点在快照中的叶载荷（规范 JSON 的内容视图）")
+    leaf_index: int = Field(
+        description="叶在排序后 Merkle 树中的下标（script_policy 叶恒为 0）"
+    )
+    proof: list[SnapshotProofStep] = Field(
+        description="自叶向上的包含证明步骤；单叶树为空列表"
+    )
+
+
+class SnapshotProofResponse(BaseModel):
+    """快照 Merkle 包含证明响应。"""
+
+    namespace: str
+    root: str = Field(description="Merkle 根哈希（十六进制）")
+    leaf_count: int = Field(
+        description=(
+            "Merkle 树叶节点总数：业务快照节点（已注册名称 + 有效预占 + 未过期冷却）"
+            "外加恒存在的 1 个生效脚本策略叶"
+        )
+    )
+    snapshot_count: int = Field(
+        description="业务快照节点总数（leaf_count - 1）；413 判定即该值是否超过 max_nodes"
+    )
+    max_nodes: int = Field(description="请求给定的业务快照节点总量上限")
+    policy: SnapshotEffectivePolicy = Field(description="快照固定的生效脚本策略（排序后的第 0 个叶）")
+    items: list[SnapshotProofItem] = Field(
+        description="每个请求节点的包含证明，按请求顺序返回（证明内容与请求顺序无关）"
+    )
+
+
 class ErrorDetail(BaseModel):
     error: str
     message: str
