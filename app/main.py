@@ -15,6 +15,7 @@
 - POST   /namespaces/{namespace}/check                              只分析不落库（200）
 - GET    /namespaces/{namespace}/names                              列出命名空间内已注册名称
 - POST   /name-risk-clusters                                        跨空间同形风险簇（200 / 413 / 422，单一读事务快照）
+- POST   /namespaces/{namespace}/snapshot-proof                     命名空间快照 Merkle 包含证明（200 / 404 / 413 / 422，单一读事务快照）
 - GET    /health                                                    健康检查
 """
 from __future__ import annotations
@@ -45,6 +46,8 @@ from .schemas import (
     ReservationRequest,
     ScriptPolicy,
     ScriptPolicyRequest,
+    SnapshotProofRequest,
+    SnapshotProofResponse,
     SwapNamesRequest,
     SwapNamesResponse,
 )
@@ -59,7 +62,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
@@ -78,7 +81,13 @@ app = FastAPI(
         "SQLite 读事务快照上固定 2–20 个命名空间的已注册名称、有效预占与"
         "未过期冷却，只对不同空间的名称按规范名相同或同形建边，按连通分量"
         "返回至少含 2 个节点的风险簇（快照总量超过 max_names 时返回 413，"
-        "不截断计算）。"
+        "不截断计算）；还支持单命名空间快照 Merkle 包含证明（POST "
+        "/namespaces/{namespace}/snapshot-proof）：在单个 SQLite 读事务快照"
+        "上固定已注册名称、有效预占、未过期冷却与生效脚本策略，节点按类型"
+        "和 id 排序后把业务字段编码为规范 JSON，以 SHA-256 构建叶哈希加 "
+        "0x00、父哈希加 0x01、奇数层复制末节点的 Merkle 树，返回根、叶数与"
+        "每个请求节点带左右方向的包含证明（节点不存在 404，快照超限 413 且"
+        "不截断；根与证明与请求节点顺序无关）。"
     ),
     lifespan=lifespan,
 )
@@ -174,6 +183,75 @@ def name_risk_clusters(
                 ),
                 "snapshot_count": exc.snapshot_count,
                 "max_names": exc.limit,
+            },
+        )
+
+
+@app.post(
+    "/namespaces/{namespace}/snapshot-proof",
+    response_model=SnapshotProofResponse,
+    responses={
+        404: {"description": "请求节点中有不存在的记录（含已过期 / 已消费预占、过期冷却），附全部缺失节点"},
+        413: {"description": "命名空间三类业务快照节点总量超过 max_nodes，未截断快照也未构建证明"},
+        422: {"description": "nodes 数量不在 1–20、含重复 (kind, id)、script_policy 的 id 非 0，或 max_nodes 超出 1–1000"},
+    },
+)
+def snapshot_proof(
+    namespace: str, payload: SnapshotProofRequest, conn=Depends(get_db)
+) -> dict:
+    """单命名空间快照 Merkle 包含证明：在同一个 SQLite 读事务快照上固定数据并建树。
+
+    接收 1–20 个由 `kind` / `id` 表示的节点（`registered` / `reservation`
+    / `released` 三类业务记录，以及 `kind="script_policy"`、`id=0` 的生效
+    策略节点）与 `max_nodes`（1–1000）。在**单个读事务**中固定该命名空间
+    的**全部已注册名称、未过期未消费预占、未过期释放冷却与生效脚本策略**
+    （只读、不清理过期记录）；三类业务节点总量超过 `max_nodes` 时直接返回
+    `413 snapshot_too_large`（附 `snapshot_count` / `max_nodes`），**不截断
+    快照、不构建 Merkle 树**。
+
+    全部叶按 `(kind, id)` 排序——生效策略恒为第一个叶（未配置空间也存在，
+    内容为内建默认策略、`revision=0`），其后依次为 registered、reservation、
+    released（各类内按 id 升序）。每个叶把业务字段编码成**规范 JSON**
+    （UTF-8、键名排序、无多余空白），以 SHA-256 建树：叶哈希为
+    `SHA256(0x00 ‖ 规范JSON)`，父哈希为 `SHA256(0x01 ‖ left ‖ right)`，
+    奇数层复制末节点与其自身配对。
+
+    返回 `root`、`leaf_count` 与每个请求节点的包含证明：`path` 自叶向根，
+    逐跳给出兄弟哈希与 `direction`（兄弟在被证明节点子树左侧为 `left`，
+    右侧为 `right`；单叶树路径为空，此时叶哈希即根）。**相同快照下请求
+    节点顺序变化不改变根、叶序与各自证明**：`proofs` 统一按 `(kind, id)`
+    升序返回。任一请求节点不存在 -> `404 snapshot_node_not_found`
+    （`missing` 附全部缺失节点）。
+    """
+    refs = [(node.kind, node.id) for node in payload.nodes]
+    try:
+        return service.build_snapshot_proof(conn, namespace, refs, payload.max_nodes)
+    except service.SnapshotNodeNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "snapshot_node_not_found",
+                "message": (
+                    "请求的节点中有不存在的记录（已注册名称 / 有效预占 / 未过期"
+                    "冷却中均无对应 kind/id；过期或已消费的预占、过期冷却同样"
+                    "按不存在处理），未生成快照证明"
+                ),
+                "missing": exc.missing,
+            },
+        )
+    except service.SnapshotTooLargeError as exc:
+        raise HTTPException(
+            status_code=413,  # 413 Payload Too Large（新旧 starlette 常量名不同，直接用字面值）
+            detail={
+                "error": "snapshot_too_large",
+                "message": (
+                    "该命名空间的已注册名称、有效预占与未过期冷却快照总量"
+                    f"为 {exc.snapshot_count}，超过请求给定的 max_nodes="
+                    f"{exc.limit}；未截断快照，也未构建 Merkle 证明，请收窄"
+                    "请求范围或提高 max_nodes 后重试"
+                ),
+                "snapshot_count": exc.snapshot_count,
+                "max_nodes": exc.limit,
             },
         )
 

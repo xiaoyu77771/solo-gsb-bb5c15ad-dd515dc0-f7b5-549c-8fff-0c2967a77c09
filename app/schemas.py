@@ -421,6 +421,140 @@ class NameRiskClustersResponse(BaseModel):
     )
 
 
+# ---------- 单命名空间快照 Merkle 包含证明 POST /namespaces/{namespace}/snapshot-proof ----------
+
+# 快照证明支持的四类节点：三类业务记录 + 生效脚本策略本身
+SnapshotNodeKind = Literal["registered", "reservation", "released", "script_policy"]
+
+# 一次证明请求的节点数量与快照节点总量上限（与接口约束保持一致）
+MIN_SNAPSHOT_PROOF_NODES = 1
+MAX_SNAPSHOT_PROOF_NODES = 20
+MAX_SNAPSHOT_PROOF_SNAPSHOT = 1000
+
+
+class SnapshotProofNode(BaseModel):
+    """待证明节点：由 kind / id 表示。
+
+    registered / reservation / released 分别引用已注册名称、未过期未消费
+    预占与未过期释放冷却的行 id；script_policy 引用命名空间的生效脚本策略
+    快照，该类节点只有一个实例且 id 固定为 0（未配置策略也存在，内容为
+    内建默认策略、revision=0）。
+    """
+
+    kind: SnapshotNodeKind
+    id: int = Field(
+        ge=0,
+        examples=[1],
+        description="节点行 id；script_policy 节点固定为 0，其余三类必须 ≥1",
+    )
+
+    @model_validator(mode="after")
+    def _validate_id_for_kind(self) -> "SnapshotProofNode":
+        if self.kind == "script_policy" and self.id != 0:
+            raise ValueError("script_policy 节点只有一个，id 必须为 0")
+        if self.kind != "script_policy" and self.id < 1:
+            raise ValueError("registered / reservation / released 节点的 id 必须 ≥ 1")
+        return self
+
+
+class SnapshotProofRequest(BaseModel):
+    """快照包含证明请求体：1–20 个节点引用 + 快照业务节点总量上限。"""
+
+    nodes: list[SnapshotProofNode] = Field(
+        min_length=MIN_SNAPSHOT_PROOF_NODES,
+        max_length=MAX_SNAPSHOT_PROOF_NODES,
+        examples=[[{"kind": "registered", "id": 1}]],
+        description=(
+            "请求包含证明的 1–20 个节点（kind/id）；结果与输入顺序无关，"
+            "响应 proofs 统一按 (kind, id) 升序返回"
+        ),
+    )
+    max_nodes: int = Field(
+        ge=1,
+        le=MAX_SNAPSHOT_PROOF_SNAPSHOT,
+        examples=[100],
+        description=(
+            "命名空间内已注册名称、有效预占与未过期冷却三类业务快照节点的"
+            "总量上限；实际总量超过该值时返回 413 且不截断、不构建证明"
+            "（生效脚本策略叶不计入该总量）"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_distinct_nodes(self) -> "SnapshotProofRequest":
+        keys = [(node.kind, node.id) for node in self.nodes]
+        if len(set(keys)) != len(keys):
+            raise ValueError("nodes 中的 (kind, id) 节点必须互不相同")
+        return self
+
+
+class SnapshotProofStep(BaseModel):
+    """包含证明路径中的一跳：当前层的兄弟哈希与其所在方向。"""
+
+    direction: Literal["left", "right"] = Field(
+        description=(
+            "兄弟节点相对于被证明节点所在子树的方向：left 表示兄弟在左侧"
+            "（计算 parent = SHA256(0x01 ‖ sibling ‖ current)），"
+            "right 表示兄弟在右侧（parent = SHA256(0x01 ‖ current ‖ sibling)）"
+        )
+    )
+    sibling_hash: str = Field(description="兄弟节点的十六进制 SHA-256 哈希（父节点为 0x01 前缀）")
+
+
+class SnapshotProofItem(BaseModel):
+    """单个请求节点的包含证明：按 (kind, id) 升序给出，与请求顺序无关。"""
+
+    index: int = Field(ge=0, description="该叶节点在排序后 Merkle 树中的下标（从 0 开始）")
+    kind: SnapshotNodeKind
+    id: int
+    leaf_hash: str = Field(description="叶哈希：SHA256(0x00 ‖ 规范 JSON 业务字段)")
+    leaf_payload: dict = Field(
+        description="参与哈希的规范 JSON 对象原文（sort_keys、无多余空白），供调用方直接复核"
+    )
+    path: list[SnapshotProofStep] = Field(
+        description=(
+            "自叶到根的包含路径（单叶树为空列表，此时 leaf_hash 即 root）；"
+            "奇数层复制末节点参与计算，复制不会产生额外路径跳数"
+        )
+    )
+
+
+class EffectiveScriptPolicyPayload(BaseModel):
+    """随快照一起固定的命名空间生效混脚本策略（也是树中的第一个叶）。"""
+
+    configured: bool = Field(
+        description="命名空间是否显式配置过策略；false 时 blocked_script_pairs 为内建默认策略、revision 为 0"
+    )
+    revision: int = Field(ge=0, description="显式配置时为策略 revision；未配置时逻辑版本为 0")
+    blocked_script_pairs: list[list[str]] = Field(
+        description="生效中的阻断脚本对（无序、已去重，按字典序排列）"
+    )
+
+
+class SnapshotProofResponse(BaseModel):
+    """快照 Merkle 包含证明结果。"""
+
+    namespace: str
+    root: str = Field(description="Merkle 树根（十六进制 SHA-256）")
+    leaf_count: int = Field(
+        ge=1,
+        description=(
+            "树中叶节点总数 = 三类业务快照节点数 + 1（生效脚本策略叶）"
+        ),
+    )
+    snapshot_count: int = Field(
+        ge=0,
+        description="同一读事务快照内三类业务节点总数（已注册名称 + 有效预占 + 未过期冷却）",
+    )
+    max_nodes: int = Field(description="请求给定的业务快照节点总量上限")
+    script_policy: EffectiveScriptPolicyPayload = Field(
+        description="本次快照固定的生效混脚本策略（对应 script_policy/0 叶）"
+    )
+    proofs: list[SnapshotProofItem] = Field(
+        description="每个请求节点的包含证明，按 (kind, id) 升序排列，与请求顺序无关"
+    )
+
+
 class ErrorDetail(BaseModel):
     error: str
     message: str

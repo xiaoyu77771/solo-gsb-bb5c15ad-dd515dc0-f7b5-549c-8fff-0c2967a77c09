@@ -104,9 +104,29 @@
    reservation < released，预占与冷却附 expires_at；边端点小者为
    source 并附 reasons；簇按最小节点键排序、cluster_id 从 1 编号，
    簇内节点与边均确定性排序
+
+单命名空间快照 Merkle 包含证明（build_snapshot_proof，
+POST /namespaces/{namespace}/snapshot-proof）：
+1. 接收 1–20 个由 kind/id 表示的节点（registered/reservation/released
+   三类业务记录，外加 kind=script_policy、id 固定为 0 的生效策略节点）与
+   max_nodes（1–1000），在单个只读事务（BEGIN 读事务）中固定该命名空间
+   的全部已注册名称、未过期未消费预占、未过期释放冷却与生效脚本策略；
+   同一事务保证四类数据来自同一份数据库快照，只读不清理过期记录
+2. 业务快照节点总量（三类记录之和）超过 max_nodes 时抛
+   SnapshotTooLargeError（-> 413），绝不截断快照、也不构建 Merkle 树；
+   任一请求节点在快照中不存在（含过期 / 已消费预占、过期冷却、跨表 id）
+   抛 SnapshotNodeNotFoundError（-> 404，附全部缺失节点）
+3. 每个节点按类型与 id 排序后，把业务字段编码成规范 JSON（UTF-8、
+   sort_keys、无多余空白），以 SHA-256 构建 Merkle 树：叶哈希加 0x00
+   前缀，父哈希加 0x01 前缀，奇数层复制末节点；生效策略恒为排序后的
+   第一个叶（script_policy/0）
+4. 返回 root、leaf_count 与每个请求节点的包含证明（path 自叶到根，逐跳
+   给出兄弟哈希与左右方向）；相同快照下请求节点的顺序变化不改变根、
+   叶序与各自证明——proofs 统一按 (kind, id) 升序返回
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -282,6 +302,32 @@ class RiskSnapshotTooLargeError(Exception):
 
     def __init__(self, snapshot_count: int, limit: int):
         super().__init__("risk_snapshot_too_large")
+        self.snapshot_count = snapshot_count
+        self.limit = limit
+
+
+class SnapshotNodeNotFoundError(Exception):
+    """快照证明请求的节点在读事务快照中不存在（HTTP 404）。
+
+    missing 为全部缺失节点（按请求顺序去重前给出），每项为 {"kind", "id"}；
+    过期 / 已消费预占、过期冷却、错误表 id 均按不存在处理。
+    """
+
+    def __init__(self, missing: list[dict]):
+        super().__init__("snapshot_node_not_found")
+        self.missing = missing
+
+
+class SnapshotTooLargeError(Exception):
+    """单命名空间快照证明的业务节点总量超过请求方给定的 max_nodes（HTTP 413）。
+
+    snapshot_count 为同一读事务快照内已注册名称 + 有效预占 + 未过期冷却的
+    总数（不含生效脚本策略叶），limit 为请求方给定的上限；超限后不截断
+    快照、不构建 Merkle 树。
+    """
+
+    def __init__(self, snapshot_count: int, limit: int):
+        super().__init__("snapshot_too_large")
         self.snapshot_count = snapshot_count
         self.limit = limit
 
@@ -1841,3 +1887,322 @@ def _edge_sort_key(edge: dict) -> tuple:
         (target["namespace"], RISK_KIND_ORDER[target["kind"]], target["id"]),
         tuple(edge["reasons"]),
     )
+
+
+# ---------- 单命名空间快照 Merkle 包含证明 ----------
+
+
+# 叶排序序值：生效脚本策略恒为第一个叶；其后与风险簇一致
+# registered < reservation < released
+SNAPSHOT_KIND_ORDER = {
+    "script_policy": 0,
+    SOURCE_REGISTERED: 1,   # "registered"
+    SOURCE_RESERVATION: 2,  # "reservation"
+    SOURCE_RELEASED: 3,     # "released"
+}
+
+# Merkle 域分隔前缀：叶 0x00、内部节点 0x01，防止“叶即内部节点”的第二原像攻击
+MERKLE_LEAF_PREFIX = b"\x00"
+MERKLE_PARENT_PREFIX = b"\x01"
+
+
+def _proof_registered_rows(
+    conn: sqlite3.Connection, namespace: str
+) -> list[dict]:
+    """读取命名空间的全部已注册名称（单独函数，便于并发测试注入）。"""
+    rows = conn.execute(
+        """
+        SELECT id, original_name, normalized_name, revision, created_at
+        FROM display_names
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _proof_reservation_rows(
+    conn: sqlite3.Connection, namespace: str, now: datetime
+) -> list[dict]:
+    """读取命名空间的未消费、未过期预占（单独函数，便于并发测试注入）。
+
+    不返回 token：它是确认注册用的能力凭证而非业务字段，不应进入可被
+    外部复核的叶哈希。过期 / 已消费记录在 Python 侧过滤（只读不清理）。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, original_name, normalized_name, expires_at, created_at
+        FROM name_reservations
+        WHERE namespace = ? AND consumed_at IS NULL
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def _proof_cooldown_rows(
+    conn: sqlite3.Connection, namespace: str, now: datetime
+) -> list[dict]:
+    """读取命名空间的未过期释放冷却记录（单独函数，便于并发测试注入）。"""
+    rows = conn.execute(
+        """
+        SELECT id, original_name, normalized_name, cooldown_seconds,
+               expires_at, created_at
+        FROM name_cooldowns
+        WHERE namespace = ?
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > now
+    ]
+
+
+def canonical_json_bytes(payload: dict) -> bytes:
+    """业务字段的规范 JSON 编码：UTF-8、键名排序、无多余空白、非 ASCII 原样。
+
+    同一份数据在任何语言 / 平台上按该规则重编码都得到逐字节一致的结果，
+    因而可以直接复核叶哈希。
+    """
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def merkle_leaf_hash(payload: dict) -> bytes:
+    """叶哈希：SHA256(0x00 ‖ 规范 JSON 业务字段)。"""
+    return hashlib.sha256(MERKLE_LEAF_PREFIX + canonical_json_bytes(payload)).digest()
+
+
+def _merkle_parent(left: bytes, right: bytes) -> bytes:
+    """父哈希：SHA256(0x01 ‖ left ‖ right)。"""
+    return hashlib.sha256(MERKLE_PARENT_PREFIX + left + right).digest()
+
+
+def build_merkle_levels(leaf_hashes: list[bytes]) -> list[list[bytes]]:
+    """自叶向根构建各层哈希；奇数层复制末节点后两两配对。
+
+    返回 [叶层, 第一层父节点, ..., 根层（仅 1 个元素）]；单叶树只返回
+    [叶层]，此时根就是该叶自身。
+    """
+    levels = [list(leaf_hashes)]
+    while len(levels[-1]) > 1:
+        current = levels[-1]
+        if len(current) % 2 == 1:
+            # 奇数层：末节点复制一份与其自身配对（复制不产生额外节点）
+            current = [*current, current[-1]]
+        levels.append(
+            [
+                _merkle_parent(current[pos], current[pos + 1])
+                for pos in range(0, len(current), 2)
+            ]
+        )
+    return levels
+
+
+def _merkle_inclusion_path(
+    levels: list[list[bytes]], index: int
+) -> list[dict]:
+    """构建叶下标 index 自叶到根的包含路径。
+
+    每跳给出兄弟哈希与 direction——兄弟位于被证明节点所在子树的左侧时
+    direction="left"（验证：parent = h(0x01 ‖ sibling ‖ current)），
+    位于右侧时 direction="right"（验证：parent = h(0x01 ‖ current ‖ sibling)）。
+    奇数层复制出的兄弟就是末节点自身；单叶树路径为空。
+    """
+    path: list[dict] = []
+    pos = index
+    for level in levels[:-1]:
+        padded = [*level, level[-1]] if len(level) % 2 == 1 else level
+        if pos % 2 == 0:
+            # 当前节点是左孩子：兄弟在右侧
+            path.append(
+                {"direction": "right", "sibling_hash": padded[pos + 1].hex()}
+            )
+        else:
+            # 当前节点是右孩子：兄弟在左侧
+            path.append(
+                {"direction": "left", "sibling_hash": padded[pos - 1].hex()}
+            )
+        pos //= 2
+    return path
+
+
+def verify_merkle_inclusion(root_hex: str, proof: dict) -> bool:
+    """按包含路径自叶向根复核：叶哈希逐层与兄弟（带 0x01 前缀）配对后应等于根。
+
+    direction="left" 时兄弟在当前值左侧，反之在右侧；单叶树 path 为空，
+    leaf_hash 必须直接等于 root。
+    """
+    current = bytes.fromhex(proof["leaf_hash"])
+    for step in proof["path"]:
+        sibling = bytes.fromhex(step["sibling_hash"])
+        if step["direction"] == "left":
+            current = hashlib.sha256(
+                MERKLE_PARENT_PREFIX + sibling + current
+            ).digest()
+        else:
+            current = hashlib.sha256(
+                MERKLE_PARENT_PREFIX + current + sibling
+            ).digest()
+    return current.hex() == root_hex
+
+
+def build_snapshot_proof(
+    conn: sqlite3.Connection,
+    namespace: str,
+    refs: list[tuple[str, int]],
+    max_nodes: int,
+    now: datetime | None = None,
+) -> dict:
+    """在单个 SQLite 读事务快照上为命名空间节点构建 Merkle 包含证明。
+
+    refs 为去重后的 (kind, id) 列表（kind ∈ registered/reservation/
+    released/script_policy；script_policy 的 id 恒为 0，由 schema 层保证），
+    max_nodes 为三类业务节点总量上限（生效策略叶不计入）。流程：
+
+    1. 同一个只读事务（BEGIN 读事务）中依次读取该命名空间的全部已注册
+       名称、未过期未消费预占、未过期冷却与生效脚本策略，保证后续全部
+       计算基于同一份数据库快照（事务期间其他连接的提交不可见）；只读
+       路径不做惰性清理，过期 / 已消费记录在 Python 侧过滤
+    2. 三类业务节点总量超过 max_nodes -> SnapshotTooLargeError（-> 413），
+       绝不截断快照，也不构建 Merkle 树
+    3. 任一请求节点不在快照中（含过期 / 已消费预占、过期冷却、错误表 id）
+       -> SnapshotNodeNotFoundError（-> 404，missing 附全部缺失节点）
+    4. 叶按 (kind 序, id) 排序——生效策略恒为第一个叶（script_policy/0），
+       其后 registered、reservation、released 各自按 id 升序；业务字段编码
+       为规范 JSON 后以 SHA-256 建 Merkle 树（叶 0x00、父 0x01、奇数层复制
+       末节点），返回 root / leaf_count 与每个请求节点的包含证明
+
+    结果与请求节点顺序无关：proofs 统一按 (kind, id) 升序返回；相同快照
+    下无论请求顺序如何变化，根与同一节点的叶哈希 / 路径都保持不变。
+    """
+    moment = now or utc_now()
+    # 去重并按 (kind 序, id) 规范化，使输出与请求顺序完全无关
+    ordered_refs = sorted(set(refs), key=lambda ref: (SNAPSHOT_KIND_ORDER[ref[0]], ref[1]))
+
+    # 单一读事务固定全部快照：事务期间其他连接的提交对本连接不可见
+    conn.execute("BEGIN")
+    try:
+        registered_rows = _proof_registered_rows(conn, namespace)
+        reservation_rows = _proof_reservation_rows(conn, namespace, moment)
+        cooldown_rows = _proof_cooldown_rows(conn, namespace, moment)
+        policy = get_script_policy(conn, namespace)
+
+        snapshot_count = (
+            len(registered_rows) + len(reservation_rows) + len(cooldown_rows)
+        )
+        # 先做总量闸门：超限直接 413，不截断快照、不建树（与风险簇一致）
+        if snapshot_count > max_nodes:
+            raise SnapshotTooLargeError(snapshot_count, max_nodes)
+
+        # 生效策略叶：未配置空间也固定为“内建默认策略、revision=0”
+        policy_effective = {
+            "configured": policy is not None,
+            "revision": policy["revision"] if policy is not None else 0,
+            "blocked_script_pairs": [
+                list(pair)
+                for pair in (
+                    policy["blocked_script_pairs"]
+                    if policy is not None
+                    else DEFAULT_BLOCKED_PAIRS
+                )
+            ],
+        }
+        policy_payload = {
+            "kind": "script_policy",
+            "id": 0,
+            **policy_effective,
+        }
+
+        # 业务叶：仅编码业务字段（预占不含 token 能力凭证），按 kind 序与 id 排
+        leaves: list[dict] = [policy_payload]
+        for row in registered_rows:
+            leaves.append(
+                {
+                    "kind": SOURCE_REGISTERED,
+                    "id": row["id"],
+                    "original_name": row["original_name"],
+                    "normalized_name": row["normalized_name"],
+                    "revision": row["revision"],
+                    "created_at": row["created_at"],
+                }
+            )
+        for row in reservation_rows:
+            leaves.append(
+                {
+                    "kind": SOURCE_RESERVATION,
+                    "id": row["id"],
+                    "original_name": row["original_name"],
+                    "normalized_name": row["normalized_name"],
+                    "expires_at": row["expires_at"],
+                    "created_at": row["created_at"],
+                }
+            )
+        for row in cooldown_rows:
+            leaves.append(
+                {
+                    "kind": SOURCE_RELEASED,
+                    "id": row["id"],
+                    "original_name": row["original_name"],
+                    "normalized_name": row["normalized_name"],
+                    "cooldown_seconds": row["cooldown_seconds"],
+                    "expires_at": row["expires_at"],
+                    "created_at": row["created_at"],
+                }
+            )
+
+        present_keys = {
+            (leaf["kind"], leaf["id"])
+            for leaf in leaves
+        }
+        missing = [
+            {"kind": kind, "id": node_id}
+            for kind, node_id in ordered_refs
+            if (kind, node_id) not in present_keys
+        ]
+        if missing:
+            raise SnapshotNodeNotFoundError(missing)
+
+        leaf_hashes = [merkle_leaf_hash(leaf) for leaf in leaves]
+        levels = build_merkle_levels(leaf_hashes)
+        root = levels[-1][0]
+        key_to_index = {
+            (leaf["kind"], leaf["id"]): index
+            for index, leaf in enumerate(leaves)
+        }
+
+        proofs: list[dict] = []
+        for kind, node_id in ordered_refs:
+            index = key_to_index[(kind, node_id)]
+            proofs.append(
+                {
+                    "index": index,
+                    "kind": kind,
+                    "id": node_id,
+                    "leaf_hash": leaf_hashes[index].hex(),
+                    "leaf_payload": leaves[index],
+                    "path": _merkle_inclusion_path(levels, index),
+                }
+            )
+    finally:
+        conn.rollback()
+
+    return {
+        "namespace": namespace,
+        "root": root.hex(),
+        "leaf_count": len(leaves),
+        "snapshot_count": snapshot_count,
+        "max_nodes": max_nodes,
+        "script_policy": policy_effective,
+        "proofs": proofs,
+    }

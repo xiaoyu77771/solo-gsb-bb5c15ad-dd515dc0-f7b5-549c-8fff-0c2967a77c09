@@ -3192,3 +3192,573 @@ def test_openapi_documents_name_risk_clusters_endpoint(client):
     assert "200" in operation["responses"]
     assert "413" in operation["responses"]
     assert "422" in operation["responses"]
+
+
+# ---------- 单命名空间快照 Merkle 包含证明 POST /namespaces/{namespace}/snapshot-proof ----------
+
+
+def snapshot_proof(client, nodes, max_nodes=100, namespace="chat"):
+    return client.post(
+        f"/namespaces/{namespace}/snapshot-proof",
+        json={"nodes": nodes, "max_nodes": max_nodes},
+    )
+
+
+def compute_leaf_hash(payload: dict) -> str:
+    """按接口约定重算叶哈希：SHA256(0x00 ‖ 规范 JSON)。"""
+    import hashlib
+    import json
+
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(b"\x00" + canonical).hexdigest()
+
+
+def verify_inclusion(root: str, proof: dict) -> bool:
+    """自叶向根按左右方向复核包含证明（测试侧独立实现，不依赖服务层验证函数）。"""
+    import hashlib
+
+    # 先用规范 JSON 重算叶哈希，再逐层与兄弟（0x01 前缀）配对
+    assert compute_leaf_hash(proof["leaf_payload"]) == proof["leaf_hash"]
+    current = bytes.fromhex(proof["leaf_hash"])
+    for step in proof["path"]:
+        sibling = bytes.fromhex(step["sibling_hash"])
+        if step["direction"] == "left":
+            current = hashlib.sha256(b"\x01" + sibling + current).digest()
+        else:
+            current = hashlib.sha256(b"\x01" + current + sibling).digest()
+    return current.hex() == root
+
+
+def test_snapshot_proof_registered_name_and_default_policy_leaves(client):
+    created = register(client, "Alice").json()
+
+    resp = snapshot_proof(
+        client,
+        [{"kind": "registered", "id": created["id"]}, {"kind": "script_policy", "id": 0}],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["namespace"] == "chat"
+    assert body["snapshot_count"] == 1
+    assert body["leaf_count"] == 2  # 1 条已注册名称 + 1 个生效策略叶
+    assert body["max_nodes"] == 100
+    # 未配置策略：内建默认三对、revision=0、configured=False
+    assert body["script_policy"] == {
+        "configured": False,
+        "revision": 0,
+        "blocked_script_pairs": DEFAULT_PAIRS,
+    }
+
+    proofs = {(p["kind"], p["id"]): p for p in body["proofs"]}
+    assert set(proofs) == {("registered", created["id"]), ("script_policy", 0)}
+    # 生效策略恒为排序后的第一个叶
+    assert proofs[("script_policy", 0)]["index"] == 0
+    assert proofs[("registered", created["id"])]["index"] == 1
+    # 每个叶哈希都可由返回的规范 JSON 原文独立重算，路径逐跳复核到根
+    for proof in body["proofs"]:
+        assert verify_inclusion(body["root"], proof)
+
+
+def test_snapshot_proof_single_leaf_tree_empty_path_leaf_is_root(client):
+    # 空命名空间只请求策略叶：单叶树，路径为空，leaf_hash 直接等于 root
+    resp = snapshot_proof(client, [{"kind": "script_policy", "id": 0}])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["leaf_count"] == 1
+    assert body["snapshot_count"] == 0
+    (proof,) = body["proofs"]
+    assert proof["index"] == 0
+    assert proof["path"] == []
+    assert proof["leaf_hash"] == body["root"]
+
+
+def test_snapshot_proof_odd_level_duplicates_last_node(client):
+    # 3 个业务节点 + 1 个策略叶 = 4 叶（偶数）；再造一个变成 5 叶，
+    # 第二层（3 个节点）为奇数层：末节点复制后与自身配对
+    first = register(client, "n1").json()["id"]
+    second = register(client, "n2").json()["id"]
+    third = register(client, "n3").json()["id"]
+    fourth = register(client, "n4").json()["id"]
+
+    body = snapshot_proof(
+        client, [{"kind": "registered", "id": each} for each in (first, second, third, fourth)]
+        + [{"kind": "script_policy", "id": 0}]
+    ).json()
+    assert body["leaf_count"] == 5
+    proofs = {(p["kind"], p["id"]): p for p in body["proofs"]}
+    for proof in body["proofs"]:
+        assert verify_inclusion(body["root"], proof)
+
+    # 5 叶建 3 层：叶层 5（配对 01/23/44）-> 3 个节点的奇数层（配对
+    # 01/22，末节点复制自配）-> 根。策略叶在下标 0，三跳兄弟全在右侧。
+    import hashlib
+
+    last_leaf = bytes.fromhex(proofs[("registered", fourth)]["leaf_hash"])
+    duplicated_parent = hashlib.sha256(b"\x01" + last_leaf + last_leaf).hexdigest()
+    policy_path = proofs[("script_policy", 0)]["path"]
+    assert [step["direction"] for step in policy_path] == ["right", "right", "right"]
+    # 中间奇数层只有右半部分（下标 2）复制自配：末业务叶的第二跳兄弟
+    # 是它自身的父哈希（方向 right，复制兄弟 = 当前父节点）
+    last_path = proofs[("registered", fourth)]["path"]
+    assert [step["direction"] for step in last_path] == ["right", "right", "left"]
+    assert last_path[1]["sibling_hash"] == duplicated_parent
+
+
+def test_snapshot_proof_includes_all_three_business_kinds_with_fields(client):
+    reservation = reserve(client, "carol", ttl_seconds=300).json()
+    created = register(client, "Dave").json()
+    cooldown = release(
+        client, created["id"], expected_revision=1, cooldown_seconds=720
+    ).json()
+
+    resp = snapshot_proof(
+        client,
+        [
+            {"kind": "reservation", "id": reservation["id"]},
+            {"kind": "released", "id": cooldown["id"]},
+            {"kind": "script_policy", "id": 0},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["snapshot_count"] == 2  # 1 条有效预占 + 1 条未过期冷却
+    assert body["leaf_count"] == 3
+    proofs = {(p["kind"], p["id"]): p for p in body["proofs"]}
+
+    # 叶排序：script_policy(0) < registered < reservation < released
+    assert proofs[("script_policy", 0)]["index"] == 0
+    assert proofs[("reservation", reservation["id"])]["index"] == 1
+    assert proofs[("released", cooldown["id"])]["index"] == 2
+
+    reservation_leaf = proofs[("reservation", reservation["id"])]["leaf_payload"]
+    assert reservation_leaf == {
+        "kind": "reservation",
+        "id": reservation["id"],
+        "original_name": "carol",
+        "normalized_name": "carol",
+        "expires_at": reservation["expires_at"],
+        "created_at": reservation_leaf["created_at"],
+    }
+    # token 是确认注册用的能力凭证，绝不进入叶哈希
+    assert "token" not in reservation_leaf
+
+    released_leaf = proofs[("released", cooldown["id"])]["leaf_payload"]
+    assert released_leaf["kind"] == "released"
+    assert released_leaf["cooldown_seconds"] == 720
+    assert released_leaf["expires_at"] == cooldown["expires_at"]
+    assert released_leaf["normalized_name"] == "dave"
+    for proof in body["proofs"]:
+        assert verify_inclusion(body["root"], proof)
+
+
+def test_snapshot_proof_kind_order_registered_before_reservation_before_released(client):
+    registered = register(client, "alice").json()
+    reservation = reserve(client, "bob", ttl_seconds=300).json()
+    created = register(client, "carol").json()
+    cooldown = release(client, created["id"], expected_revision=1).json()
+
+    body = snapshot_proof(
+        client,
+        [
+            {"kind": "released", "id": cooldown["id"]},
+            {"kind": "registered", "id": registered["id"]},
+            {"kind": "reservation", "id": reservation["id"]},
+            {"kind": "script_policy", "id": 0},
+        ],
+    ).json()
+    by_key = {(p["kind"], p["id"]): p["index"] for p in body["proofs"]}
+    assert by_key[("script_policy", 0)] == 0
+    assert by_key[("registered", registered["id"])] == 1
+    assert by_key[("reservation", reservation["id"])] == 2
+    assert by_key[("released", cooldown["id"])] == 3
+
+
+def test_snapshot_proof_root_covers_whole_snapshot_not_only_requested_nodes(client):
+    first = register(client, "alice").json()["id"]
+    second = register(client, "bob").json()["id"]
+    third = register(client, "carol").json()["id"]
+
+    one = snapshot_proof(client, [{"kind": "registered", "id": first}]).json()
+    two = snapshot_proof(client, [{"kind": "registered", "id": second}]).json()
+    all_three = snapshot_proof(
+        client, [{"kind": "registered", "id": each} for each in (third, first, second)]
+    ).json()
+    # 根与叶数属于整份快照：请求不同节点子集不改变 root / leaf_count
+    assert one["root"] == two["root"] == all_three["root"]
+    assert one["leaf_count"] == two["leaf_count"] == all_three["leaf_count"] == 4
+    # 但各自的证明只针对被请求节点
+    assert {(p["kind"], p["id"]) for p in one["proofs"]} == {("registered", first)}
+
+
+def test_snapshot_proof_is_independent_of_request_order(client):
+    first = register(client, "alice").json()["id"]
+    second = register(client, "bob").json()["id"]
+    reservation = reserve(client, "carol", ttl_seconds=300).json()["id"]
+
+    forward = [
+        {"kind": "script_policy", "id": 0},
+        {"kind": "registered", "id": first},
+        {"kind": "registered", "id": second},
+        {"kind": "reservation", "id": reservation},
+    ]
+    reverse = list(reversed(forward))
+    body_a = snapshot_proof(client, forward).json()
+    body_b = snapshot_proof(client, reverse).json()
+
+    # 根完全一致
+    assert body_a["root"] == body_b["root"]
+    # proofs 统一按 (kind, id) 升序：相同节点的下标 / 叶哈希 / 路径逐字节一致
+    assert body_a["proofs"] == body_b["proofs"]
+    keys = [(p["kind"], p["id"]) for p in body_a["proofs"]]
+    assert keys == [
+        ("script_policy", 0),
+        ("registered", first),
+        ("registered", second),
+        ("reservation", reservation),
+    ]
+    for proof in body_a["proofs"]:
+        assert verify_inclusion(body_a["root"], proof)
+
+
+def test_snapshot_proof_leaf_hash_uses_0x00_prefixed_canonical_json(client):
+    created = register(client, "Ａｌｉｃｅ").json()  # 全角，规范化后 alice
+
+    body = snapshot_proof(
+        client, [{"kind": "registered", "id": created["id"]}]
+    ).json()
+    proof = body["proofs"][0]
+    # 返回的原文重编码（sort_keys、无空白）后加 0x00 前缀哈希必须等于叶哈希
+    assert compute_leaf_hash(proof["leaf_payload"]) == proof["leaf_hash"]
+    assert proof["leaf_payload"]["original_name"] == "Ａｌｉｃｅ"
+    assert proof["leaf_payload"]["normalized_name"] == "alice"
+    assert proof["leaf_payload"]["revision"] == 1
+
+
+def test_snapshot_proof_404_unknown_nodes_with_all_missing_sorted(client):
+    register(client, "alice")
+
+    resp = snapshot_proof(
+        client,
+        [
+            {"kind": "registered", "id": 999},
+            {"kind": "released", "id": 1},
+            {"kind": "reservation", "id": 2},
+        ],
+    )
+    assert resp.status_code == 404
+    detail = resp.json()["detail"]
+    assert detail["error"] == "snapshot_node_not_found"
+    # missing 按 (kind 序, id) 升序：registered(1) < reservation(2) < released(3)
+    assert detail["missing"] == [
+        {"kind": "registered", "id": 999},
+        {"kind": "reservation", "id": 2},
+        {"kind": "released", "id": 1},
+    ]
+
+
+def test_snapshot_proof_404_when_expired_or_consumed_records_requested(client):
+    active = reserve(client, "active", ttl_seconds=300).json()
+    expired = reserve(client, "expired", ttl_seconds=30).json()
+    consumed = reserve(client, "consumed", ttl_seconds=300).json()
+    created = register(client, "gone").json()
+    cooldown = release(client, created["id"], expected_revision=1, cooldown_seconds=60).json()
+
+    conn = database.get_connection()
+    try:
+        # 直接把预占标记为已消费（不经过 claim，避免额外写入 display_names）
+        conn.execute(
+            "UPDATE name_reservations SET consumed_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00.000Z", consumed["id"]),
+        )
+        conn.execute(
+            "UPDATE name_reservations SET expires_at = '2000-01-01T00:00:00.000Z' "
+            "WHERE id = ?",
+            (expired["id"],),
+        )
+        conn.execute(
+            "UPDATE name_cooldowns SET expires_at = '2000-01-01T00:00:00.000Z' "
+            "WHERE id = ?",
+            (cooldown["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 过期预占 / 已消费预占 / 过期冷却一律按不存在处理 -> 404；有效预占不受影响
+    resp = snapshot_proof(
+        client,
+        [
+            {"kind": "reservation", "id": active["id"]},
+            {"kind": "reservation", "id": expired["id"]},
+            {"kind": "reservation", "id": consumed["id"]},
+            {"kind": "released", "id": cooldown["id"]},
+        ],
+    )
+    assert resp.status_code == 404
+    missing = resp.json()["detail"]["missing"]
+    assert {(m["kind"], m["id"]) for m in missing} == {
+        ("reservation", expired["id"]),
+        ("reservation", consumed["id"]),
+        ("released", cooldown["id"]),
+    }
+
+    # 过期 / 已消费记录也不计入快照总量：snapshot_count 只含 1 条有效预占
+    assert snapshot_proof(
+        client, [{"kind": "reservation", "id": active["id"]}]
+    ).json()["snapshot_count"] == 1
+
+
+def test_snapshot_proof_404_cross_namespace_and_wrong_table_id(client):
+    created = register(client, "alice", namespace="a").json()
+
+    # id 属于命名空间 a，在 b 下取证明 -> 404
+    resp = snapshot_proof(
+        client, [{"kind": "registered", "id": created["id"]}], namespace="b"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["missing"] == [
+        {"kind": "registered", "id": created["id"]}
+    ]
+
+    # 已注册名称的 id 用 reservation kind 请求：不同表里查不到 -> 404
+    resp = snapshot_proof(
+        client, [{"kind": "reservation", "id": created["id"]}], namespace="a"
+    )
+    assert resp.status_code == 404
+
+
+def test_snapshot_proof_413_when_snapshot_exceeds_max_nodes_without_truncation(client):
+    register(client, "alice")
+    register(client, "bob")
+    reservation = reserve(client, "carol", ttl_seconds=300).json()
+
+    # 三类业务节点共 3 个：max_nodes=2 -> 413（策略叶不计入上限）
+    resp = snapshot_proof(
+        client, [{"kind": "registered", "id": 1}], max_nodes=2
+    )
+    assert resp.status_code == 413
+    detail = resp.json()["detail"]
+    assert detail["error"] == "snapshot_too_large"
+    assert detail["snapshot_count"] == 3
+    assert detail["max_nodes"] == 2
+
+    # 即使只请求一个节点也不截断建树
+    assert "root" not in resp.json()
+
+    # 边界：恰好等于上限 -> 200，leaf_count 含策略叶
+    body = snapshot_proof(
+        client, [{"kind": "reservation", "id": reservation["id"]}], max_nodes=3
+    ).json()
+    assert body["snapshot_count"] == 3
+    assert body["leaf_count"] == 4
+
+
+def test_snapshot_proof_request_validation(client):
+    # 空节点列表 / 超过 20 个 -> 422
+    assert snapshot_proof(client, []).status_code == 422
+    assert snapshot_proof(
+        client, [{"kind": "registered", "id": i} for i in range(1, 22)]
+    ).status_code == 422
+
+    # 重复 (kind, id) -> 422
+    assert snapshot_proof(
+        client,
+        [
+            {"kind": "registered", "id": 1},
+            {"kind": "registered", "id": 1},
+        ],
+    ).status_code == 422
+    # 两个不同 kind 的 id=1 不算重复，可通过 schema（节点是否存在是 404 的事）
+    assert snapshot_proof(
+        client,
+        [
+            {"kind": "registered", "id": 1},
+            {"kind": "reservation", "id": 1},
+        ],
+    ).status_code == 404
+    # script_policy 重复 -> 422
+    assert snapshot_proof(
+        client,
+        [{"kind": "script_policy", "id": 0}, {"kind": "script_policy", "id": 0}],
+    ).status_code == 422
+    # script_policy 的 id 必须为 0
+    assert snapshot_proof(
+        client, [{"kind": "script_policy", "id": 1}]
+    ).status_code == 422
+    # 业务节点 id 必须 ≥ 1
+    assert snapshot_proof(
+        client, [{"kind": "registered", "id": 0}]
+    ).status_code == 422
+    # 未知 kind / 缺字段 -> 422
+    assert snapshot_proof(client, [{"kind": "weird", "id": 1}]).status_code == 422
+    assert client.post(
+        "/namespaces/chat/snapshot-proof", json={"nodes": [{"id": 1}], "max_nodes": 10}
+    ).status_code == 422
+    # max_nodes 越界（1–1000）
+    assert snapshot_proof(
+        client, [{"kind": "registered", "id": 1}], max_nodes=0
+    ).status_code == 422
+    assert snapshot_proof(
+        client, [{"kind": "registered", "id": 1}], max_nodes=1001
+    ).status_code == 422
+    # 缺 max_nodes
+    assert client.post(
+        "/namespaces/chat/snapshot-proof",
+        json={"nodes": [{"kind": "registered", "id": 1}]},
+    ).status_code == 422
+
+
+def test_snapshot_proof_pins_configured_policy_and_root_changes_with_policy(client):
+    created = register(client, "alice").json()
+    before = snapshot_proof(
+        client,
+        [{"kind": "registered", "id": created["id"]}, {"kind": "script_policy", "id": 0}],
+    ).json()
+    assert before["script_policy"]["configured"] is False
+
+    # 收紧策略（只阻断 Han+Latin，现存 alice 合规）
+    assert put_policy(client, [["Han", "Latin"]], expected_revision=0).status_code == 200
+
+    after = snapshot_proof(
+        client,
+        [{"kind": "registered", "id": created["id"]}, {"kind": "script_policy", "id": 0}],
+    ).json()
+    assert after["script_policy"] == {
+        "configured": True,
+        "revision": 1,
+        "blocked_script_pairs": [["Han", "Latin"]],
+    }
+    # 业务叶没变、策略叶变了：根必须变化；业务叶哈希保持不变
+    assert after["root"] != before["root"]
+    before_leaves = {(p["kind"], p["id"]): p["leaf_hash"] for p in before["proofs"]}
+    after_leaves = {(p["kind"], p["id"]): p["leaf_hash"] for p in after["proofs"]}
+    assert (
+        before_leaves[("registered", created["id"])]
+        == after_leaves[("registered", created["id"])]
+    )
+    assert (
+        before_leaves[("script_policy", 0)] != after_leaves[("script_policy", 0)]
+    )
+    for proof in after["proofs"]:
+        assert verify_inclusion(after["root"], proof)
+
+
+def test_snapshot_proof_direction_semantics_alternate_with_position(client):
+    # 4 个叶：下标 0/2 的节点首跳兄弟在右（direction=right），
+    # 下标 1/3 的节点首跳兄弟在左（direction=left）
+    ids = [register(client, f"name{i}").json()["id"] for i in range(3)]
+    body = snapshot_proof(
+        client,
+        [{"kind": "script_policy", "id": 0}]
+        + [{"kind": "registered", "id": each} for each in ids],
+    ).json()
+    first_directions = {
+        (p["kind"], p["id"]): p["path"][0]["direction"] for p in body["proofs"]
+    }
+    assert first_directions[("script_policy", 0)] == "right"  # 下标 0
+    assert first_directions[("registered", ids[0])] == "left"  # 下标 1
+    assert first_directions[("registered", ids[1])] == "right"  # 下标 2
+    assert first_directions[("registered", ids[2])] == "left"  # 下标 3
+
+
+def test_snapshot_proof_fix_snapshot_in_single_read_transaction_wal(client, monkeypatch):
+    """WAL 下读事务快照固定：事务开始后另一连接的提交不计入本次证明。"""
+    assert register(client, "app", namespace="a").status_code == 201
+    conn = database.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    finally:
+        conn.close()
+
+    real_reservation_rows = service._proof_reservation_rows
+    injected = {"done": False}
+
+    def racing_reservation_rows(read_conn, namespace, now):
+        # 读事务已开始且已读完 display_names：另一连接提交新注册名称
+        if not injected["done"]:
+            injected["done"] = True
+            other = database.get_connection()
+            try:
+                service.insert_name(other, namespace, "racer", "racer")
+            finally:
+                other.close()
+        return real_reservation_rows(read_conn, namespace, now)
+
+    monkeypatch.setattr(service, "_proof_reservation_rows", racing_reservation_rows)
+
+    body = snapshot_proof(
+        client, [{"kind": "registered", "id": 1}], namespace="a"
+    ).json()
+    # 新名称在本事务快照之后提交：不计入快照、不进树
+    assert body["snapshot_count"] == 1
+    assert body["leaf_count"] == 2  # 策略 + 原 1 条名称
+
+    # 不带注入再次调用：新名称可见，同一份证明语义下根发生变化
+    second = snapshot_proof(
+        client,
+        [{"kind": "registered", "id": 1}, {"kind": "registered", "id": 2}],
+        namespace="a",
+    )
+    assert second.status_code == 200
+    assert second.json()["snapshot_count"] == 2
+    assert second.json()["root"] != body["root"]
+
+
+def test_snapshot_proof_concurrent_requests_no_5xx(client):
+    for i in range(5):
+        register(client, f"user{i}")
+
+    def post(seq):
+        return snapshot_proof(
+            client,
+            [
+                {"kind": "registered", "id": (seq % 5) + 1},
+                {"kind": "script_policy", "id": 0},
+            ],
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(post, range(16)))
+    assert codes == [200] * 16
+
+
+def test_snapshot_proof_service_helpers_and_verifier(client):
+    """服务层：建水平铺、奇数复制与验证助手在多尺寸下自洽。"""
+    import hashlib
+
+    def h(index: int) -> bytes:
+        return hashlib.sha256(f"leaf-{index}".encode()).digest()
+
+    for size in range(1, 9):
+        leaves = [h(i) for i in range(size)]
+        levels = service.build_merkle_levels(leaves)
+        root = levels[-1][0]
+        for index in range(size):
+            path = service._merkle_inclusion_path(levels, index)
+            proof = {"leaf_hash": leaves[index].hex(), "path": path}
+            assert service.verify_merkle_inclusion(root.hex(), proof)
+            # 破坏一个兄弟哈希后验证必须失败
+            if path:
+                tampered = {
+                    "leaf_hash": leaves[index].hex(),
+                    "path": [
+                        {
+                            "direction": step["direction"],
+                            "sibling_hash": "00" * 32,
+                        }
+                        for step in path
+                    ],
+                }
+                assert not service.verify_merkle_inclusion(root.hex(), tampered)
+
+
+def test_openapi_documents_snapshot_proof_endpoint(client):
+    operation = client.get("/openapi.json").json()["paths"][
+        "/namespaces/{namespace}/snapshot-proof"
+    ]["post"]
+    assert "200" in operation["responses"]
+    assert "404" in operation["responses"]
+    assert "413" in operation["responses"]
+    assert "422" in operation["responses"]
